@@ -1,13 +1,4 @@
 use arrayvec::ArrayVec;
-use shaderc;
-use winit::dpi::LogicalSize;
-use winit::CreationError;
-use winit::Event;
-use winit::EventsLoop;
-use winit::Window;
-use winit::WindowBuilder;
-use winit::WindowEvent;
-
 use core::ops::Deref;
 #[cfg(feature = "dx12")]
 use gfx_backend_dx12 as back;
@@ -72,17 +63,155 @@ use gfx_hal::{
     window::{Backbuffer, Extent2D, FrameSync, PresentMode, Swapchain, SwapchainConfig},
     Backend, DescriptorPool, Gpu, Graphics, Instance, QueueFamily, Surface,
 };
+use nalgebra_glm as glm;
+
+use gfx_hal::memory::Pod;
+use gfx_hal::pso::ElemStride;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
+use shaderc;
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::mem::size_of_val;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::time::Instant;
+use winit::dpi::LogicalSize;
+use winit::CreationError;
+use winit::Event;
+use winit::EventsLoop;
+use winit::Window;
+use winit::WindowBuilder;
+use winit::WindowEvent;
 
 static VERTEX_SOURCE: &'static str = include_str!("vert.glsl");
 static FRAGMENT_SOURCE: &'static str = include_str!("fragment.glsl");
 pub static BOX_TEX_BYTES: &[u8] = include_bytes!("box.jpg");
+
+/// DO NOT USE THE VERSION OF THIS FUNCTION THAT'S IN THE GFX-HAL CRATE.
+///
+/// It can trigger UB if you upcast from a low alignment to a higher alignment
+/// type. You'll be sad.
+pub fn cast_slice<T: Pod, U: Pod>(ts: &[T]) -> Option<&[U]> {
+    use core::mem::{align_of, size_of};
+    // Handle ZST (this all const folds)
+    if size_of::<T>() == 0 || size_of::<U>() == 0 {
+        if size_of::<T>() == size_of::<U>() {
+            unsafe {
+                return Some(core::slice::from_raw_parts(
+                    ts.as_ptr() as *const U,
+                    ts.len(),
+                ));
+            }
+        } else {
+            return None;
+        }
+    }
+    // Handle alignments (this const folds)
+    if align_of::<U>() > align_of::<T>() {
+        // possible mis-alignment at the new type (this is a real runtime check)
+        if (ts.as_ptr() as usize) % align_of::<U>() != 0 {
+            return None;
+        }
+    }
+    if size_of::<T>() == size_of::<U>() {
+        // same size, so we direct cast, keeping the old length
+        unsafe {
+            Some(core::slice::from_raw_parts(
+                ts.as_ptr() as *const U,
+                ts.len(),
+            ))
+        }
+    } else {
+        // we might have slop, which would cause us to fail
+        let byte_size = size_of::<T>() * ts.len();
+        let (new_count, new_overflow) = (byte_size / size_of::<U>(), byte_size % size_of::<U>());
+        if new_overflow > 0 {
+            return None;
+        } else {
+            unsafe {
+                Some(core::slice::from_raw_parts(
+                    ts.as_ptr() as *const U,
+                    new_count,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct Vertex {
+    xyz: [f32; 3],
+    uv: [f32; 2],
+}
+impl Vertex {
+    pub fn attributes() -> Vec<AttributeDesc> {
+        let position_attribute = AttributeDesc {
+            location: 0,
+            binding: 0,
+            element: Element {
+                format: Format::Rgb32Float,
+                offset: 0,
+            },
+        };
+
+        let uv_attribute = AttributeDesc {
+            location: 1,
+            binding: 0,
+            element: Element {
+                format: Format::Rg32Float,
+                offset: size_of::<[f32; 3]>() as ElemOffset,
+            },
+        };
+
+        vec![position_attribute, uv_attribute]
+    }
+}
+
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const CUBE_VERTEXES: [Vertex; 24] = [
+    // Face 1 (front)
+    Vertex { xyz: [0.0, 0.0, 0.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [0.0, 1.0, 0.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [1.0, 0.0, 0.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [1.0, 1.0, 0.0], uv: [1.0, 0.0] }, /* top right */
+    // Face 2 (top)
+    Vertex { xyz: [0.0, 1.0, 0.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [0.0, 1.0, 1.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [1.0, 1.0, 0.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [1.0, 1.0, 1.0], uv: [1.0, 0.0] }, /* top right */
+    // Face 3 (back)
+    Vertex { xyz: [0.0, 0.0, 1.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [0.0, 1.0, 1.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [1.0, 0.0, 1.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [1.0, 1.0, 1.0], uv: [1.0, 0.0] }, /* top right */
+    // Face 4 (bottom)
+    Vertex { xyz: [0.0, 0.0, 0.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [0.0, 0.0, 1.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [1.0, 0.0, 0.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [1.0, 0.0, 1.0], uv: [1.0, 0.0] }, /* top right */
+    // Face 5 (left)
+    Vertex { xyz: [0.0, 0.0, 1.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [0.0, 1.0, 1.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [0.0, 0.0, 0.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [0.0, 1.0, 0.0], uv: [1.0, 0.0] }, /* top right */
+    // Face 6 (right)
+    Vertex { xyz: [1.0, 0.0, 0.0], uv: [0.0, 1.0] }, /* bottom left */
+    Vertex { xyz: [1.0, 1.0, 0.0], uv: [0.0, 0.0] }, /* top left */
+    Vertex { xyz: [1.0, 0.0, 1.0], uv: [1.0, 1.0] }, /* bottom right */
+    Vertex { xyz: [1.0, 1.0, 1.0], uv: [1.0, 0.0] }, /* top right */
+];
+
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const CUBE_INDEXES: [u16; 36] = [
+    0,  1,  2,  2,  1,  3, // front
+    4,  5,  6,  7,  6,  5, // top
+    10,  9,  8,  9, 10, 11, // back
+    12, 14, 13, 15, 13, 14, // bottom
+    16, 17, 18, 19, 18, 17, // left
+    20, 21, 22, 23, 22, 21, // right
+];
 
 pub struct LoadedImage<B: Backend, D: Device<B>> {
     pub image: ManuallyDrop<B::Image>,
@@ -421,8 +550,8 @@ impl Default for WinitState {
 
 pub struct HalState {
     creation_instant: Instant,
-    vertices: BufferBundle<back::Backend, back::Device>,
-    indexes: BufferBundle<back::Backend, back::Device>,
+    cube_vertices: BufferBundle<back::Backend, back::Device>,
+    cube_indexes: BufferBundle<back::Backend, back::Device>,
     descriptor_set_layouts: Vec<<back::Backend as Backend>::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<<back::Backend as Backend>::DescriptorPool>,
     descriptor_set: ManuallyDrop<<back::Backend as Backend>::DescriptorSet>,
@@ -695,20 +824,38 @@ impl HalState {
             graphics_pipeline,
         ) = Self::create_pipeline(&mut device, extent, &render_pass)?;
 
-        const F32_XY_RGB_UV_QUAD: usize = size_of::<f32>() * (2 + 3 + 2) * 4;
-        let vertices =
-            BufferBundle::new(&adapter, &device, F32_XY_RGB_UV_QUAD, BufferUsage::VERTEX)?;
+        let vertices = BufferBundle::new(
+            &adapter,
+            &device,
+            size_of_val(&CUBE_VERTEXES),
+            BufferUsage::VERTEX,
+        )?;
 
-        const U16_QUAD_INDICES: usize = size_of::<u16>() * 2 * 3;
-        let indexes = BufferBundle::new(&adapter, &device, U16_QUAD_INDICES, BufferUsage::INDEX)?;
+        // Write the vertex data just once
+        unsafe {
+            let mut data_target = device
+                .acquire_mapping_writer(&vertices.memory, 0..vertices.requirements.size)
+                .map_err(|_| "Failed to acquire an vertex buffer mapping writer")?;
+            data_target[..CUBE_VERTEXES.len()].copy_from_slice(&CUBE_VERTEXES);
+            device
+                .release_mapping_writer(data_target)
+                .map_err(|_| "Could not release the vertex buffer mapping writer")?;
+        }
+
+        let indexes = BufferBundle::new(
+            &adapter,
+            &device,
+            size_of_val(&CUBE_INDEXES),
+            BufferUsage::INDEX,
+        )?;
 
         // Write the indices of the quad only once
         unsafe {
             let mut data_target = device
                 .acquire_mapping_writer(&indexes.memory, 0..indexes.requirements.size)
                 .map_err(|_| "Failed to acquire an index buffer mapping writer")?;
-            const INDEX_DATA: &[u16] = &[0, 1, 2, 2, 3, 0];
-            data_target[..INDEX_DATA.len()].copy_from_slice(&INDEX_DATA);
+
+            data_target[..CUBE_INDEXES.len()].copy_from_slice(&CUBE_INDEXES);
             device
                 .release_mapping_writer(data_target)
                 .map_err(|_| "Could not release the index buffer mapping writer")?;
@@ -749,8 +896,8 @@ impl HalState {
 
         Ok(Self {
             creation_instant,
-            vertices,
-            indexes,
+            cube_indexes: indexes,
+            cube_vertices: vertices,
             descriptor_set_layouts,
             descriptor_set: ManuallyDrop::new(descriptor_set),
             descriptor_pool: ManuallyDrop::new(descriptor_pool),
@@ -852,42 +999,15 @@ impl HalState {
 
             let vertex_buffers: Vec<VertexBufferDesc> = vec![VertexBufferDesc {
                 binding: 0,
-                stride: (size_of::<f32>() * 7) as u32,
+                stride: (size_of::<Vertex>()) as ElemStride,
                 rate: 0,
             }];
 
-            let position_attribute = AttributeDesc {
-                location: 0,
-                binding: 0,
-                element: Element {
-                    format: Format::Rg32Float,
-                    offset: 0,
-                },
-            };
-            let color_attribute = AttributeDesc {
-                location: 1,
-                binding: 0,
-                element: Element {
-                    format: Format::Rgb32Float,
-                    offset: (size_of::<f32>() * 2) as ElemOffset,
-                },
-            };
-
-            let uv_attribute = AttributeDesc {
-                location: 2,
-                binding: 0,
-                element: Element {
-                    format: Format::Rgb32Float,
-                    offset: (size_of::<f32>() * (2 + 3)) as ElemOffset,
-                },
-            };
-
-            let attributes: Vec<AttributeDesc> =
-                vec![position_attribute, color_attribute, uv_attribute];
+            let attributes: Vec<AttributeDesc> = Vertex::attributes();
 
             let rasterizer = Rasterizer {
                 polygon_mode: PolygonMode::Fill,
-                cull_face: Face::NONE,
+                cull_face: Face::BACK,
                 front_face: FrontFace::Clockwise,
                 depth_clamping: false,
                 depth_bias: None,
@@ -949,7 +1069,7 @@ impl HalState {
                         .create_descriptor_set_layout(bindings, immutable_samplers)
                         .map_err(|_| "Could not make a descriptor set layout")?
                 }];
-            let push_constants = vec![(ShaderStageFlags::FRAGMENT, 0..1)];
+            let push_constants = vec![(ShaderStageFlags::VERTEX, 0..16)];
 
             // Create a descriptor pool
             let mut descriptor_pool = unsafe {
@@ -1064,7 +1184,10 @@ impl HalState {
         unsafe {
             let mut data_target = self
                 .device
-                .acquire_mapping_writer(&self.vertices.memory, 0..self.vertices.requirements.size)
+                .acquire_mapping_writer(
+                    &self.cube_vertices.memory,
+                    0..self.cube_vertices.requirements.size,
+                )
                 .map_err(|_| "Failed to acquire a memory writer")?;
             let points = quad.vertex_attributes();
             debug!("{:#?}", points);
@@ -1094,10 +1217,11 @@ impl HalState {
 
                 encoder.bind_graphics_pipeline(&self.graphics_pipeline);
 
-                let vertex_buffers: ArrayVec<[_; 1]> = [(self.vertices.buffer.deref(), 0)].into();
+                let vertex_buffers: ArrayVec<[_; 1]> =
+                    [(self.cube_vertices.buffer.deref(), 0)].into();
                 encoder.bind_vertex_buffers(0, vertex_buffers);
                 encoder.bind_index_buffer(IndexBufferView {
-                    buffer: &self.indexes.buffer,
+                    buffer: &self.cube_indexes.buffer,
                     offset: 0,
                     index_type: IndexType::U16,
                 });
@@ -1116,6 +1240,118 @@ impl HalState {
                     &[time_f32.to_bits()],
                 );
                 encoder.draw_indexed(0..6, 0, 0..1);
+            }
+            buffer.finish();
+        }
+
+        // Submission and Present
+        let command_buffers = &self.command_buffers[i_usize..=i_usize];
+        let wait_semaphores: ArrayVec<[_; 1]> =
+            [(image_available, PipelineStage::COLOR_ATTACHMENT_OUTPUT)].into();
+        let signal_semaphores: ArrayVec<[_; 1]> = [render_finished].into();
+        let present_wait_semaphores: ArrayVec<[_; 1]> = [render_finished].into();
+        let submission = Submission {
+            command_buffers,
+            wait_semaphores,
+            signal_semaphores,
+        };
+        let the_command_queue = &mut self.queue_group.queues[0];
+        unsafe {
+            the_command_queue.submit(submission, Some(flight_fence));
+            self.swapchain
+                .present(the_command_queue, i_u32, present_wait_semaphores)
+                .map_err(|_| "Failed to present into the swapchain")
+        }
+    }
+
+    pub fn draw_cubes_frame(&mut self, models: &[glm::TMat4<f32>]) -> Result<(), &'static str> {
+        let view = glm::look_at_lh(
+            &glm::make_vec3(&[0.0, 0.0, -5.0]),
+            &glm::make_vec3(&[0.0, 0.0, 0.0]),
+            &glm::make_vec3(&[0.0, 1.0, 0.0]).normalize(),
+        );
+
+        let projection = {
+            let mut temp = glm::perspective_lh_zo(800.0 / 600.0, f32::to_radians(50.0), 0.1, 100.0);
+            temp[(1, 1)] *= -1.0;
+            temp
+        };
+
+        let vp = projection * view;
+
+        // Setup for this frame
+        let image_available = &self.image_available_semaphores[self.current_frame];
+        let render_finished = &self.render_finished_semaphores[self.current_frame];
+
+        // Advance the frame before we extract optionals
+        self.current_frame = (self.current_frame + 1) % self.frames_in_flight;
+
+        let (i_u32, i_usize) = unsafe {
+            let image_index = self
+                .swapchain
+                .acquire_image(core::u64::MAX, FrameSync::Semaphore(image_available))
+                .expect("Couldn't acquire an image from the swapchain!");
+
+            (image_index, image_index as usize)
+        };
+
+        let flight_fence = &self.in_flight_fences[i_usize];
+        unsafe {
+            self.device
+                .wait_for_fence(flight_fence, core::u64::MAX)
+                .map_err(|_| "Failed to wait on flight_fence")?;
+
+            self.device
+                .reset_fence(flight_fence)
+                .map_err(|_| "Couln't reset flight_fence")?;
+        }
+
+        // Time data
+        let duration = Instant::now().duration_since(self.creation_instant);
+        let time_f32 = duration.as_secs() as f32 + duration.subsec_nanos() as f32 * 1e-9;
+        // Record Commands
+        unsafe {
+            let buffer = &mut self.command_buffers[i_usize];
+            const TRIANGLE_CLEAR: [ClearValue; 1] =
+                [ClearValue::Color(ClearColor::Float([0.1, 0.2, 0.3, 1.0]))];
+            buffer.begin(false);
+            {
+                let mut encoder = buffer.begin_render_pass_inline(
+                    &self.render_pass,
+                    &self.framebuffers[i_usize],
+                    self.render_area,
+                    TRIANGLE_CLEAR.iter(),
+                );
+
+                encoder.bind_graphics_pipeline(&self.graphics_pipeline);
+
+                let vertex_buffers: ArrayVec<[_; 1]> =
+                    [(self.cube_vertices.buffer.deref(), 0)].into();
+                encoder.bind_vertex_buffers(0, vertex_buffers);
+                encoder.bind_index_buffer(IndexBufferView {
+                    buffer: &self.cube_indexes.buffer,
+                    offset: 0,
+                    index_type: IndexType::U16,
+                });
+
+                encoder.bind_graphics_descriptor_sets(
+                    &self.pipeline_layout,
+                    0,
+                    Some(self.descriptor_set.deref()),
+                    &[],
+                );
+
+                for model in models.iter() {
+                    let mvp = vp * model;
+                    encoder.push_graphics_constants(
+                        &self.pipeline_layout,
+                        ShaderStageFlags::VERTEX,
+                        0,
+                        cast_slice::<f32, u32>(&mvp.data).expect("This never fails"),
+                    );
+
+                    encoder.draw_indexed(0..36, 0, 0..1);
+                }
             }
             buffer.finish();
         }
@@ -1245,10 +1481,11 @@ pub struct UserInput {
     pub end_requested: bool,
     pub new_frame_size: Option<(f64, f64)>,
     pub new_mouse_position: Option<(f64, f64)>,
+    pub seconds: f32,
 }
 
 impl UserInput {
-    pub fn poll_events_loop(events_loop: &mut EventsLoop) -> Self {
+    pub fn poll_events_loop(events_loop: &mut EventsLoop, last_timestamp: &mut Instant) -> Self {
         let mut output = UserInput::default();
         events_loop.poll_events(|event| match event {
             Event::WindowEvent {
@@ -1270,16 +1507,25 @@ impl UserInput {
             _ => (),
         });
 
+        output.seconds = {
+            let now = Instant::now();
+            let duration = now.duration_since(*last_timestamp);
+            *last_timestamp = now;
+            duration.as_secs() as f32 + duration.subsec_nanos() as f32 * 1e-9
+        };
+
         output
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LocalState {
     pub frame_width: f64,
     pub frame_height: f64,
     pub mouse_x: f64,
     pub mouse_y: f64,
+    pub cubes: Vec<glm::TMat4<f32>>,
+    pub spare_time: f32,
 }
 
 impl LocalState {
@@ -1292,18 +1538,15 @@ impl LocalState {
             self.mouse_x = position.0;
             self.mouse_y = position.1;
         }
+        assert!(self.frame_width != 0.0 && self.frame_height != 0.0);
+
+        self.spare_time += input.seconds;
+        const ONE_SIXTIETH: f32 = 1.0 / 60.0;
     }
 }
 
 fn do_the_render(hal_state: &mut HalState, local_state: &LocalState) -> Result<(), &'static str> {
-    let quad = Quad {
-        x: -0.8,
-        y: -0.8,
-        width: 1.6,
-        height: 1.6,
-    };
-
-    hal_state.draw_quad_frame(quad)
+    hal_state.draw_cubes_frame(&local_state.cubes)
 }
 
 fn main() {
@@ -1326,10 +1569,19 @@ fn main() {
         frame_height,
         mouse_x: 0.0,
         mouse_y: 0.0,
+        cubes: vec![
+            glm::identity(),
+            glm::translate(&glm::identity(), &glm::make_vec3(&[1.5, 0.1, 0.0])),
+            glm::translate(&glm::identity(), &glm::make_vec3(&[-3.0, 2.0, 3.0])),
+            glm::translate(&glm::identity(), &glm::make_vec3(&[0.5, -4.0, 4.0])),
+            glm::translate(&glm::identity(), &glm::make_vec3(&[-3.4, -2.3, 1.0])),
+            glm::translate(&glm::identity(), &glm::make_vec3(&[-2.8, -0.7, 5.0])),
+        ],
+        spare_time: 0.0,
     };
-
+    let mut last_timestamp = Instant::now();
     loop {
-        let inputs = UserInput::poll_events_loop(&mut winit_state.events_loop);
+        let inputs = UserInput::poll_events_loop(&mut winit_state.events_loop, &mut last_timestamp);
         if inputs.end_requested {
             break;
         }
