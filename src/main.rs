@@ -70,6 +70,7 @@ use gfx_hal::pso::ElemStride;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use shaderc;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::mem::size_of_val;
@@ -78,8 +79,12 @@ use std::ops::Range;
 use std::time::Instant;
 use winit::dpi::LogicalSize;
 use winit::CreationError;
+use winit::DeviceEvent;
+use winit::ElementState;
 use winit::Event;
 use winit::EventsLoop;
+use winit::KeyboardInput;
+use winit::VirtualKeyCode;
 use winit::Window;
 use winit::WindowBuilder;
 use winit::WindowEvent;
@@ -135,6 +140,69 @@ pub fn cast_slice<T: Pod, U: Pod>(ts: &[T]) -> Option<&[U]> {
                     new_count,
                 ))
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub position: glm::TVec3<f32>,
+    pitch_deg: f32,
+    yaw_deg: f32,
+}
+
+impl Camera {
+    const UP: [f32; 3] = [0.0, 1.0, 0.0];
+
+    fn make_front(&self) -> glm::TVec3<f32> {
+        let pitch_rad = f32::to_radians(self.pitch_deg);
+        let yaw_rad = f32::to_radians(self.yaw_deg);
+        glm::make_vec3(&[
+            yaw_rad.sin() * pitch_rad.cos(),
+            pitch_rad.sin(),
+            yaw_rad.cos() * pitch_rad.cos(),
+        ])
+    }
+
+    pub fn update_orientation(&mut self, d_pitch_deg: f32, d_yaw_deg: f32) {
+        self.pitch_deg = (self.pitch_deg + d_pitch_deg).max(-89.0).min(89.0);
+        self.yaw_deg = (self.yaw_deg + d_yaw_deg) % 360.0;
+    }
+
+    pub fn update_position(&mut self, keys: &HashSet<VirtualKeyCode>, distance: f32) {
+        let up = glm::make_vec3(&Self::UP);
+        let forward = self.make_front();
+        let cross_normalized = glm::cross::<f32, glm::U3>(&forward, &up).normalize();
+
+        let mut move_vector = keys
+            .iter()
+            .fold(glm::make_vec3(&[0.0, 0.0, 0.0]), |vec, key| match *key {
+                VirtualKeyCode::W => vec + forward,
+                VirtualKeyCode::S => vec - forward,
+                VirtualKeyCode::A => vec + cross_normalized,
+                VirtualKeyCode::D => vec - cross_normalized,
+                _ => vec,
+            });
+
+        if move_vector != glm::zero() {
+            move_vector = move_vector.normalize();
+            self.position += move_vector * distance;
+        }
+    }
+
+    pub fn make_view_matrix(&self) -> glm::TMat4<f32> {
+        glm::look_at_lh(
+            &self.position,
+            &(self.position + self.make_front()),
+            &glm::make_vec3(&Self::UP),
+        )
+    }
+
+    pub const fn at_position(position: glm::TVec3<f32>) -> Self {
+        Self {
+            position,
+            pitch_deg: 0.0,
+            yaw_deg: 0.0,
         }
     }
 }
@@ -511,6 +579,7 @@ impl<B: Backend, D: Device<B>> BufferBundle<B, D> {
 pub struct WinitState {
     pub events_loop: EventsLoop,
     pub window: Window,
+    pub keys_held: HashSet<VirtualKeyCode>,
 }
 
 impl WinitState {
@@ -524,6 +593,7 @@ impl WinitState {
         output.map(|window| Self {
             events_loop,
             window,
+            keys_held: HashSet::new(),
         })
     }
 }
@@ -1264,21 +1334,11 @@ impl HalState {
         }
     }
 
-    pub fn draw_cubes_frame(&mut self, models: &[glm::TMat4<f32>]) -> Result<(), &'static str> {
-        let view = glm::look_at_lh(
-            &glm::make_vec3(&[0.0, 0.0, -5.0]),
-            &glm::make_vec3(&[0.0, 0.0, 0.0]),
-            &glm::make_vec3(&[0.0, 1.0, 0.0]).normalize(),
-        );
-
-        let projection = {
-            let mut temp = glm::perspective_lh_zo(800.0 / 600.0, f32::to_radians(50.0), 0.1, 100.0);
-            temp[(1, 1)] *= -1.0;
-            temp
-        };
-
-        let vp = projection * view;
-
+    pub fn draw_cubes_frame(
+        &mut self,
+        view_projection: &glm::TMat4<f32>,
+        models: &[glm::TMat4<f32>],
+    ) -> Result<(), &'static str> {
         // Setup for this frame
         let image_available = &self.image_available_semaphores[self.current_frame];
         let render_finished = &self.render_finished_semaphores[self.current_frame];
@@ -1342,7 +1402,7 @@ impl HalState {
                 );
 
                 for model in models.iter() {
-                    let mvp = vp * model;
+                    let mvp = view_projection * model;
                     encoder.push_graphics_constants(
                         &self.pipeline_layout,
                         ShaderStageFlags::VERTEX,
@@ -1476,33 +1536,64 @@ impl core::ops::Drop for HalState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UserInput {
     pub end_requested: bool,
     pub new_frame_size: Option<(f64, f64)>,
     pub new_mouse_position: Option<(f64, f64)>,
     pub seconds: f32,
+    pub keys_held: HashSet<VirtualKeyCode>,
 }
 
 impl UserInput {
-    pub fn poll_events_loop(events_loop: &mut EventsLoop, last_timestamp: &mut Instant) -> Self {
+    pub fn poll_events_loop(winit_state: &mut WinitState, last_timestamp: &mut Instant) -> Self {
         let mut output = UserInput::default();
+        let events_loop = &mut winit_state.events_loop;
+        let keys_held = &mut winit_state.keys_held;
+
         events_loop.poll_events(|event| match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => output.end_requested = true,
+            Event::DeviceEvent {
+                event:
+                    DeviceEvent::Key(KeyboardInput {
+                        virtual_keycode: Some(code),
+                        state,
+                        ..
+                    }),
+                ..
+            } => drop(match state {
+                ElementState::Pressed => keys_held.insert(code),
+                ElementState::Released => keys_held.remove(&code),
+            }),
+            Event::WindowEvent {
+                event:
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                state,
+                                virtual_keycode: Some(code),
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => {
+                #[cfg(feature = "metal")]
+                {
+                    match state {
+                        ElementState::Pressed => keys_held.insert(code),
+                        ElementState::Released => keys_held.remove(&code),
+                    }
+                };
+            }
             Event::WindowEvent {
                 event: WindowEvent::Resized(logical),
                 ..
             } => {
                 output.new_frame_size = Some((logical.width, logical.height));
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CursorMoved { position, .. },
-                ..
-            } => {
-                output.new_mouse_position = Some((position.x, position.y));
             }
             _ => (),
         });
@@ -1513,17 +1604,20 @@ impl UserInput {
             *last_timestamp = now;
             duration.as_secs() as f32 + duration.subsec_nanos() as f32 * 1e-9
         };
+        output.keys_held = keys_held.clone();
 
         output
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LocalState {
     pub frame_width: f64,
     pub frame_height: f64,
     pub mouse_x: f64,
     pub mouse_y: f64,
+    pub camera: Camera,
+    pub projection: glm::TMat4<f32>,
     pub cubes: Vec<glm::TMat4<f32>>,
     pub spare_time: f32,
 }
@@ -1541,12 +1635,15 @@ impl LocalState {
         assert!(self.frame_width != 0.0 && self.frame_height != 0.0);
 
         self.spare_time += input.seconds;
-        const ONE_SIXTIETH: f32 = 1.0 / 60.0;
+
+        self.camera.update_position(&input.keys_held, 0.1);
     }
 }
 
 fn do_the_render(hal_state: &mut HalState, local_state: &LocalState) -> Result<(), &'static str> {
-    hal_state.draw_cubes_frame(&local_state.cubes)
+    let vp = local_state.projection * local_state.camera.make_view_matrix();
+
+    hal_state.draw_cubes_frame(&vp, &local_state.cubes)
 }
 
 fn main() {
@@ -1569,6 +1666,12 @@ fn main() {
         frame_height,
         mouse_x: 0.0,
         mouse_y: 0.0,
+        camera: Camera::at_position(glm::make_vec3(&[0.0, 0.0, -5.0])),
+        projection: {
+            let mut temp = glm::perspective_lh_zo(800.0 / 600.0, f32::to_radians(50.0), 0.1, 100.0);
+            temp[(1, 1)] *= -1.0;
+            temp
+        },
         cubes: vec![
             glm::identity(),
             glm::translate(&glm::identity(), &glm::make_vec3(&[1.5, 0.1, 0.0])),
@@ -1581,7 +1684,7 @@ fn main() {
     };
     let mut last_timestamp = Instant::now();
     loop {
-        let inputs = UserInput::poll_events_loop(&mut winit_state.events_loop, &mut last_timestamp);
+        let inputs = UserInput::poll_events_loop(&mut winit_state, &mut last_timestamp);
         if inputs.end_requested {
             break;
         }
