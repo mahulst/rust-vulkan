@@ -88,6 +88,7 @@ use winit::VirtualKeyCode;
 use winit::Window;
 use winit::WindowBuilder;
 use winit::WindowEvent;
+use nalgebra_glm::sin;
 
 static VERTEX_SOURCE: &'static str = include_str!("vert.glsl");
 static FRAGMENT_SOURCE: &'static str = include_str!("fragment.glsl");
@@ -142,6 +143,12 @@ pub fn cast_slice<T: Pod, U: Pod>(ts: &[T]) -> Option<&[U]> {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct UniformBlock {
+    projection: [[f32; 4]; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -622,6 +629,7 @@ pub struct HalState {
     creation_instant: Instant,
     cube_vertices: BufferBundle<back::Backend, back::Device>,
     cube_indexes: BufferBundle<back::Backend, back::Device>,
+    uniform: BufferBundle<back::Backend, back::Device>,
     descriptor_set_layouts: Vec<<back::Backend as Backend>::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<<back::Backend as Backend>::DescriptorPool>,
     descriptor_set: ManuallyDrop<<back::Backend as Backend>::DescriptorSet>,
@@ -931,6 +939,36 @@ impl HalState {
                 .map_err(|_| "Could not release the index buffer mapping writer")?;
         }
 
+        // Create uniform buffer
+        let uniform = BufferBundle::new(
+            &adapter,
+            &device,
+            size_of::<UniformBlock>(),
+            BufferUsage::UNIFORM,
+        )?;
+
+        const UNIFORM_DATA: [UniformBlock; 1] = [UniformBlock {
+            projection: [
+                [0.5, 0.0, 0.0, 0.0],
+                [0.0, 0.5, 0.0, 0.0],
+                [0.0, 0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }];
+
+        // Write default data to uniform buffer
+        unsafe {
+            let mut data_target = device
+                .acquire_mapping_writer(&uniform.memory, 0..uniform.requirements.size)
+                .map_err(|_| "Could not acquire a uniform buffer mapping writer")?;
+
+            data_target[..UNIFORM_DATA.len()].copy_from_slice(&UNIFORM_DATA);
+
+            device
+                .release_mapping_writer(data_target)
+                .map_err(|_| "Could not release the uniform buffer mapping writer")?;
+        }
+
         // Create descriptors
         let texture = LoadedImage::new(
             &adapter,
@@ -959,6 +997,15 @@ impl HalState {
                     array_offset: 0,
                     descriptors: Some(gfx_hal::pso::Descriptor::Sampler(texture.sampler.deref())),
                 },
+                gfx_hal::pso::DescriptorSetWrite {
+                    set: &descriptor_set,
+                    binding: 2,
+                    array_offset: 0,
+                    descriptors: Some(gfx_hal::pso::Descriptor::Buffer(
+                        uniform.buffer.deref(),
+                        None..None,
+                    )),
+                },
             ])
         }
 
@@ -968,6 +1015,7 @@ impl HalState {
             creation_instant,
             cube_indexes: indexes,
             cube_vertices: vertices,
+            uniform,
             descriptor_set_layouts,
             descriptor_set: ManuallyDrop::new(descriptor_set),
             descriptor_pool: ManuallyDrop::new(descriptor_pool),
@@ -1131,6 +1179,13 @@ impl HalState {
                     stage_flags: ShaderStageFlags::FRAGMENT,
                     immutable_samplers: false,
                 },
+                DescriptorSetLayoutBinding {
+                    binding: 2,
+                    ty: gfx_hal::pso::DescriptorType::UniformBuffer,
+                    count: 1,
+                    stage_flags: ShaderStageFlags::VERTEX,
+                    immutable_samplers: false,
+                },
             ];
             let immutable_samplers = Vec::<<back::Backend as Backend>::Sampler>::new();
             let descriptor_set_layouts: Vec<<back::Backend as Backend>::DescriptorSetLayout> =
@@ -1153,6 +1208,10 @@ impl HalState {
                             },
                             gfx_hal::pso::DescriptorRangeDesc {
                                 ty: gfx_hal::pso::DescriptorType::Sampler,
+                                count: 1,
+                            },
+                            gfx_hal::pso::DescriptorRangeDesc {
+                                ty: gfx_hal::pso::DescriptorType::UniformBuffer,
                                 count: 1,
                             },
                         ],
@@ -1642,6 +1701,36 @@ impl LocalState {
 
 fn do_the_render(hal_state: &mut HalState, local_state: &LocalState) -> Result<(), &'static str> {
     let vp = local_state.projection * local_state.camera.make_view_matrix();
+
+
+    // Update uniform buffer
+
+    let duration = Instant::now().duration_since(hal_state.creation_instant);
+    let time_f32 = duration.as_secs() as f32 + duration.subsec_nanos() as f32 * 1e-9;
+
+    let zoom = time_f32.cos() * 0.5 + 1.0;
+    let uniform_data = [UniformBlock {
+        projection: [
+            [zoom, 0.0, 0.0, 0.0],
+            [0.0, zoom, 0.0, 0.0],
+            [0.0, 0.0, zoom, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    }];
+
+    // Write default data to uniform buffer
+    unsafe {
+        let mut data_target = hal_state.device
+            .acquire_mapping_writer(&hal_state.uniform.memory, 0..hal_state.uniform.requirements.size)
+            .map_err(|_| "Could not acquire a uniform buffer mapping writer")?;
+
+        data_target[..uniform_data.len()].copy_from_slice(&uniform_data);
+
+        hal_state.device
+            .release_mapping_writer(data_target)
+            .map_err(|_| "Could not release the uniform buffer mapping writer")?;
+    }
+
 
     hal_state.draw_cubes_frame(&vp, &local_state.cubes)
 }
