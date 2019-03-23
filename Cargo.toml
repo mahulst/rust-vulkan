@@ -19,7 +19,7 @@ arrayvec = "0.4"
 shaderc = "0.3.16"
 image = "0.21"
 nalgebra-glm = "0.2"
-
+lyon = "0.13"
 [dependencies.gfx-backend-vulkan]
 version = "0.1"
 optional = true
